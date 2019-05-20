@@ -1,15 +1,13 @@
 package universe
 
 import (
-	"context"
 	"fmt"
-	"time"
 
 	"github.com/influxdata/flux"
+	"github.com/influxdata/flux/control"
 	"github.com/influxdata/flux/execute"
 	"github.com/influxdata/flux/interpreter"
 	"github.com/influxdata/flux/lang"
-	"github.com/influxdata/flux/memory"
 	"github.com/influxdata/flux/semantic"
 	"github.com/influxdata/flux/values"
 	"github.com/influxdata/flux/values/objects"
@@ -33,7 +31,8 @@ func init() {
 }
 
 func NewTableFindFunction() values.Value {
-	return values.NewFunction("tableFind",
+	tf := &tableFind{}
+	f := values.NewFunction("tableFind",
 		semantic.NewFunctionPolyType(semantic.FunctionPolySignature{
 			Parameters: map[string]semantic.PolyType{
 				tableFindStreamArg: flux.TableObjectType,
@@ -48,12 +47,27 @@ func NewTableFindFunction() values.Value {
 			Required:     semantic.LabelSet{tableFindStreamArg, tableFindFunctionArg},
 			PipeArgument: tableFindStreamArg,
 			Return:       objects.TableType,
-		}),
-		tableFindCall,
-		false)
+		}), tf.Call, false)
+	tf.fn = f
+	// Set a default execution context. If another one is needed, it will be injected upon query execution.
+	tf.SetExecutionContext(control.NewDefaultExecutionContext())
+	return tf
 }
 
-func tableFindCall(args values.Object) (values.Value, error) {
+// Type alias to avoid name collision (values.Function vs Function() method in values.Value).
+type fn = values.Function
+
+// tableFind is a values.Function and a control.ExecutionAwareValue.
+type tableFind struct {
+	fn
+	ec *control.ExecutionContext
+}
+
+func (tf *tableFind) SetExecutionContext(ec *control.ExecutionContext) {
+	tf.ec = ec
+}
+
+func (tf *tableFind) Call(args values.Object) (values.Value, error) {
 	arguments := interpreter.NewArguments(args)
 	var to *flux.TableObject
 	if v, err := arguments.GetRequired(tableFindStreamArg); err != nil {
@@ -69,17 +83,15 @@ func tableFindCall(args values.Object) (values.Value, error) {
 		return nil, fmt.Errorf("missing argument: %s", tableFindFunctionArg)
 	}
 
-	c := lang.TableObjectCompiler{
-		Tables: to,
-		Now:    time.Now(),
-	}
-
-	p, err := c.Compile(context.Background())
+	p, err := lang.CompileTableObject(to, tf.ec.ExecutionTime)
 	if err != nil {
 		return nil, errors.Wrap(err, "error in table object compilation")
 	}
 
-	q, err := p.Start(context.Background(), &memory.Allocator{})
+	p.SetExecutorDependencies(tf.ec.ExecutorDependencies)
+	p.SetLogger(tf.ec.Logger)
+
+	q, err := p.Start(tf.ec.RequestContext, tf.ec.Allocator)
 	if err != nil {
 		return nil, errors.Wrap(err, "error in table object start")
 	}
@@ -103,10 +115,10 @@ func tableFindCall(args values.Object) (values.Value, error) {
 				// subsequent calls to getRecord/Column idempotent. If we don't do it, then it would be
 				// consumed by calls to `Do`, and subsequent calls to getRecord/Column would find
 				// an empty table.
-				// TODO(aff): Note that, for now, it is not enough to `tbl.RefCount(1)`, because we cannot rely on its
+				// TODO(affo): Note that, for now, it is not enough to `tbl.RefCount(1)`, because we cannot rely on its
 				//  implementation. When a table comes from `csv.from()` it is a `csv.tableDecoder` that
 				//  does nothing when `RefCount` is called.
-				if tbl, err := execute.CopyTable(tbl, &memory.Allocator{}); err != nil {
+				if tbl, err := execute.CopyTable(tbl, tf.ec.Allocator); err != nil {
 					return err
 				} else {
 					tbl.RefCount(1)

@@ -123,11 +123,10 @@ func CompileTableObject(to *flux.TableObject, now time.Time, opts ...CompileOpti
 }
 
 func WalkIR(astPkg *ast.Package, f func(o *flux.Operation) error) error {
-
-	if spec, err := spec.FromAST(context.Background(), astPkg, time.Now()); err != nil {
+	if s, err := spec.FromAST(context.Background(), astPkg, time.Now()); err != nil {
 		return err
 	} else {
-		return spec.Walk(f)
+		return s.Walk(f)
 	}
 
 }

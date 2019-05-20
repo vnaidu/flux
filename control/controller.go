@@ -26,13 +26,22 @@ import (
 
 	"github.com/influxdata/flux"
 	"github.com/influxdata/flux/execute"
+	"github.com/influxdata/flux/interpreter"
 	"github.com/influxdata/flux/lang"
 	"github.com/influxdata/flux/memory"
+	"github.com/influxdata/flux/values"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 )
+
+// ExecutionAwareValue is a value that needs the execution context of the controller
+// to carry out its job. The controller injects the execution context in every
+// ExecutionAwareValue in the prelude before running each query.
+type ExecutionAwareValue interface {
+	SetExecutionContext(*ExecutionContext)
+}
 
 // Controller provides a central location to manage all incoming queries.
 // The controller is responsible for compiling, queueing, and executing queries.
@@ -280,6 +289,8 @@ func (c *Controller) executeQuery(q *Query) {
 
 	q.alloc = new(memory.Allocator)
 	q.alloc.Limit = func(v int64) *int64 { return &v }(c.memoryBytesQuotaPerQuery)
+	// Inject the execution context in the prelude before the program starts.
+	c.injectExecutionContext(flux.Prelude(), ctx, q.alloc)
 	exec, err := q.program.Start(ctx, q.alloc)
 	if err != nil {
 		q.addRuntimeError(err)
@@ -288,6 +299,21 @@ func (c *Controller) executeQuery(q *Query) {
 	}
 	q.exec = exec
 	q.pump(exec, ctx.Done())
+}
+
+func (c *Controller) injectExecutionContext(scope interpreter.Scope, ctx context.Context, alloc *memory.Allocator) {
+	ec := &ExecutionContext{
+		RequestContext:       ctx,
+		ExecutorDependencies: c.dependencies,
+		Logger:               c.logger,
+		Allocator:            alloc,
+		ExecutionTime:        time.Now(), // TODO(affo): get Now from the compiler.
+	}
+	scope.Range(func(k string, v values.Value) {
+		if f, ok := v.(ExecutionAwareValue); ok {
+			f.SetExecutionContext(ec)
+		}
+	})
 }
 
 func (c *Controller) finish(q *Query) {
@@ -732,6 +758,26 @@ func (ti *errorCollectingTableIterator) Do(f func(t flux.Table) error) error {
 		ti.q.addRuntimeError(err)
 	}
 	return err
+}
+
+// ExecutionContext represents the context of execution of a query in the controller.
+type ExecutionContext struct {
+	RequestContext       context.Context
+	ExecutorDependencies execute.Dependencies
+	ExecutionTime        time.Time
+	Allocator            *memory.Allocator
+	Logger               *zap.Logger
+}
+
+// NewDefaultExecutionContext returns a default execution context.
+// Attributes are set to default and not left to nil.
+func NewDefaultExecutionContext() *ExecutionContext {
+	return &ExecutionContext{
+		RequestContext: context.Background(),
+		ExecutionTime:  time.Now(),
+		Allocator:      new(memory.Allocator),
+		Logger:         zap.NewNop(),
+	}
 }
 
 // State is the query state.
